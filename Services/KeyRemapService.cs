@@ -146,16 +146,19 @@ namespace OmenSuperHub.Services {
     };
 
     // 钩子线程专用状态
+    // 每个钩子线程带自己的停止标志: 万一 Join 超时,新线程也不会把老线程"复活"成第二个钩子(双注入)
+    sealed class HookThreadCtx { public volatile bool Stop; }
+    static readonly object _lock = new object();   // 线程生命周期与轮询互斥
     static Thread _thread;
-    static volatile bool _stop;
+    static HookThreadCtx _ctx;
     static IntPtr _hook = IntPtr.Zero;
     static LowLevelKeyboardProc _proc;      // ponytail: 必须保留委托引用,否则 GC 回收后原生回调崩进程
-    static int _rebindFlag;                 // 只用 Interlocked 访问,不加 volatile(否则 CS0420)
-    static volatile string _rebindReason = "";
     static int _lastHookHitTick;            // 最近一次钩子回调(Environment.TickCount 口径)
     static uint _lastInputSeen;             // 最近一次 GetLastInputInfo 的 dwTime
     static int _lastDogTick;
+    static int _lastRestartTick;
     static volatile string _desktopName = "?";
+    static bool _lastRdpState;              // 上一拍前台是否是 RDP 宿主
 
     // 800ms 轮询: 输入桌面名 / 前台进程
     static Timer _watchTimer;
@@ -201,67 +204,84 @@ namespace OmenSuperHub.Services {
     // ---------------- 钩子生命周期 ----------------
 
     static void Install() {
-      if (_thread != null) return;
-      _stop = false;
-      _proc = HookCallback;                  // 保持引用,防止委托被 GC
-      _lastHookHitTick = Environment.TickCount;
-      var t = new Thread(HookThreadProc) { IsBackground = true, Name = "KeyRemapHook" };
-      _thread = t;
-      t.Start();
-
-      // 输入桌面/前台轮询(RDP 全屏、锁屏、UAC 都会换输入桌面)
-      var old = _watchTimer;
-      _watchTimer = new Timer(WatchTick, null, 800, 800);
-      old?.Dispose();
+      lock (_lock) {
+        if (_thread == null) StartHookThread();
+        // 输入桌面/前台轮询(RDP 全屏、锁屏、UAC 都会换输入桌面)
+        if (_watchTimer == null)
+          _watchTimer = new Timer(WatchTick, null, 800, 800);
+      }
     }
 
     static void Uninstall() {
-      if (_thread != null) {
-        _stop = true;
-        var t = _thread;
-        _thread = null;
-        // 钩子线程 500ms 一轮循环,Join 给它一次翻身机会;超时也不影响进程退出(后台线程)
-        if (!t.Join(2000)) Logger.Warn("KeyRemap: hook thread did not exit in 2s");
+      lock (_lock) {
+        StopHookThread();
+        var wt = _watchTimer;
+        _watchTimer = null;
+        wt?.Dispose();
+        _lastDeskSeen = null;
+        _lastForegroundSeen = null;
+        _lastRdpState = false;
       }
-      var wt = _watchTimer;
-      _watchTimer = null;
-      wt?.Dispose();
-      _hook = IntPtr.Zero;
-      _lastDeskSeen = null;
-      _lastForegroundSeen = null;
+    }
+
+    static void StartHookThread() {
+      _proc = HookCallback;                  // 保持引用,防止委托被 GC
+      var ctx = new HookThreadCtx();
+      _ctx = ctx;
+      var t = new Thread(() => HookThreadProc(ctx)) { IsBackground = true, Name = "KeyRemapHook" };
+      _thread = t;
+      t.Start();
+    }
+
+    static void StopHookThread() {
+      var t = _thread;
+      var ctx = _ctx;
+      _thread = null;
+      _ctx = null;
+      if (t == null) return;
+      if (ctx != null) ctx.Stop = true;
+      // 钩子线程 500ms 一轮循环,Join 给它一次翻身机会;超时也不影响进程退出(后台线程)
+      if (!t.Join(2000)) Logger.Warn("KeyRemap: hook thread did not exit in 2s");
+    }
+
+    // 定时节流判断: last==0 视为首次;TickCount 是 int,连续开机 24.9 天后会变负,用 unchecked 差值
+    static bool Elapsed(int now, int last, int ms) {
+      return last == 0 || unchecked(now - last) >= ms;
+    }
+
+    // 重建整个钩子线程 —— 关键: 不能只 unhook/rehook。
+    // mstsc 全屏接管 console 之后再重装,老线程拿到的是僵死绑定: 钩子句柄有效、
+    // SetThreadDesktop 成功、桌面名仍是 Default,但回调一次都不来(实测日志 11110ms 静默)。
+    // 只有新线程重新走一遍 OpenInputDesktop + SetThreadDesktop + SetWindowsHookEx 才恢复。
+    static void RestartHook(string reason) {
+      lock (_lock) {
+        if (_thread == null) return;                  // 改键未启用
+        int now = Environment.TickCount;
+        if (!Elapsed(now, _lastRestartTick, 1500)) return;    // 节流: mstsc 内部窗口切换会抖
+        _lastRestartTick = now;
+        StopHookThread();
+        StartHookThread();
+        Logger.Info($"KeyRemap: hook thread restarted (reason={reason})");
+      }
     }
 
     // 钩子线程: 先绑到当前输入桌面,再装钩子,然后泵消息(LL 钩子必须由装载线程泵消息才会被回调)
-    static void HookThreadProc() {
-      uint tid = GetCurrentThreadId();
+    static void HookThreadProc(HookThreadCtx ctx) {
       try {
         Bind();
         var msg = new MSG();
         var empty = new IntPtr[0];
-        while (!_stop) {
-          // 500ms 超时: 兼作重装请求与看门狗的检查点
+        while (!ctx.Stop) {
           MsgWaitForMultipleObjects(0, empty, false, 500, QS_ALLINPUT);
           while (PeekMessage(out msg, IntPtr.Zero, 0, 0, PM_REMOVE)) {
             TranslateMessage(ref msg);
             DispatchMessage(ref msg);
           }
-          if (_stop) break;
-
-          if (Interlocked.Exchange(ref _rebindFlag, 0) != 0) {
-            string why = _rebindReason;
-            Unbind();
-            Bind();
-            Logger.Info($"KeyRemap: hook rebound (desktop={_desktopName}, reason={why})");
-            continue;
-          }
-
-          Watchdog();
         }
       } catch (Exception ex) {
         Logger.Error("KeyRemap hook thread: " + ex.Message);
       } finally {
         Unbind();
-        Logger.Verbose($"KeyRemap: hook thread exit (tid={tid})");
       }
     }
 
@@ -296,53 +316,52 @@ namespace OmenSuperHub.Services {
       }
     }
 
-    // 800ms 轮询: 输入桌面变了 / 前台切到(或切出) mstsc → 请求重装钩子
+    // 800ms 轮询: 输入桌面变了 / 前台在"RDP 宿主"与"非 RDP"之间翻转 → 重建钩子线程。
+    // 只看布尔状态翻转: mstsc 内部窗口(TscShellContainerClass ↔ #32770 对话框)切换不重建,
+    // 否则实测 10 秒内会重绑 13 次,每次都有 0.5~2s 的空窗,按键会漏。
     static void WatchTick(object _) {
       try {
-        if (_thread == null) return;
+        lock (_lock) { if (_thread == null) return; }
 
         string desk = QueryInputDesktopName();
         string fg = QueryForegroundSignature();
-
-        bool deskChanged = desk != null && _lastDeskSeen != null && desk != _lastDeskSeen;
-        bool fgChanged = fg != null && _lastForegroundSeen != null && fg != _lastForegroundSeen;
+        bool rdp = IsRdpSignature(fg);
         string reason = null;
 
-        if (deskChanged) reason = "inputdesktop=" + desk;
-        else if (fgChanged && (IsRdpSignature(fg) || IsRdpSignature(_lastForegroundSeen)))
-          reason = "foreground " + _lastForegroundSeen + " -> " + fg;
+        if (desk != null && _lastDeskSeen != null && desk != _lastDeskSeen)
+          reason = "inputdesktop " + _lastDeskSeen + " -> " + desk;
+        else if (rdp != _lastRdpState)
+          reason = "rdp " + _lastRdpState + " -> " + rdp + " (fg=" + fg + ")";
 
         if (desk != null) _lastDeskSeen = desk;
         if (fg != null) _lastForegroundSeen = fg;
+        _lastRdpState = rdp;
 
-        if (reason != null) RequestRebind(reason);
+        if (reason != null) { RestartHook(reason); return; }
+
+        Watchdog(rdp);
       } catch { /* 轮询失败不得成为崩溃源 */ }
     }
 
-    // 心跳看门狗: 只在 mstsc 有焦点时判(此时用户就是在用它),有输入活动但钩子 8s 没被回调 → 重装
-    static void Watchdog() {
+    // 心跳看门狗: 只在 RDP 前台时判(此时用户就是在用它),有输入活动但钩子 8s 没被回调 → 重建线程
+    static void Watchdog(bool rdp) {
+      if (!rdp) return;
       int now = Environment.TickCount;
-      if (now - _lastDogTick < 5000) return;   // 5s 节流
+      if (!Elapsed(now, _lastDogTick, 4000)) return;   // 4s 节流
       _lastDogTick = now;
-
-      if (!IsRdpSignature(_lastForegroundSeen ?? QueryForegroundSignature())) return;
 
       var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)) };
       if (!GetLastInputInfo(ref lii)) return;
       if (lii.dwTime == _lastInputSeen) return;  // 没有新的输入活动
       _lastInputSeen = lii.dwTime;
 
+      // 有符号差值: 之前用 uint 直接相减,钩子刚活动过时会算出 4294966765 这种假警报
       uint lastHit = unchecked((uint)_lastHookHitTick);
-      uint delta = unchecked(lii.dwTime - lastHit);
-      if (delta > 8000) {
-        Logger.Warn($"KeyRemap: hook silent {delta}ms while mstsc focused -> rebind");
-        RequestRebind("watchdog: no hook callback while mstsc focused");
+      int silent = unchecked((int)(lii.dwTime - lastHit));
+      if (silent > 8000) {
+        Logger.Warn($"KeyRemap: hook silent {silent}ms while rdp focused -> restart");
+        RestartHook("watchdog: hook silent " + silent + "ms");
       }
-    }
-
-    static void RequestRebind(string reason) {
-      _rebindReason = reason;
-      Interlocked.Exchange(ref _rebindFlag, 1);
     }
 
     // ---------------- 输入桌面 / 前台查询 ----------------
